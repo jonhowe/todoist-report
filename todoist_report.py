@@ -1,3 +1,4 @@
+import argparse
 import os
 import sys
 from datetime import datetime, timedelta, timezone
@@ -14,10 +15,39 @@ except ImportError:
 API_KEY_ENV_VAR = "TODOIST_API_KEY"
 PROJECT_NAME_ENV_VAR = "TODOIST_PROJECT_NAME"
 DEFAULT_PROJECT_NAME = "work"
-PROJECTS_URL = "https://api.todoist.com/rest/v1/projects"
-COMPLETED_TASKS_URL = "https://api.todoist.com/sync/v9/completed/get_all"
+PROJECTS_URL = "https://api.todoist.com/api/v1/projects"
+COMPLETED_TASKS_URL = "https://api.todoist.com/api/v1/tasks/completed/by_completion_date"
 REQUEST_TIMEOUT_SECONDS = 30
+PAGE_SIZE = 100
 ENV_FILE = Path(__file__).resolve().with_name(".env")
+
+
+def parse_args():
+    parser = argparse.ArgumentParser(
+        description="Generate a Todoist completed-task report for a project."
+    )
+    parser.add_argument(
+        "--project",
+        help=(
+            f"Todoist project name. Defaults to {PROJECT_NAME_ENV_VAR} or "
+            f"'{DEFAULT_PROJECT_NAME}'."
+        ),
+    )
+    parser.add_argument(
+        "--since",
+        help="Start of the reporting window in UTC. Accepts YYYY-MM-DD or ISO 8601.",
+    )
+    parser.add_argument(
+        "--until",
+        help="End of the reporting window in UTC. Accepts YYYY-MM-DD or ISO 8601.",
+    )
+    parser.add_argument(
+        "--output",
+        choices=("auto", "table", "plain"),
+        default="auto",
+        help="Output format. 'auto' uses tabulate when available.",
+    )
+    return parser.parse_args()
 
 
 def load_local_env():
@@ -61,8 +91,12 @@ def get_api_key():
     raise SystemExit(1)
 
 
-def get_project_name():
-    project_name = os.environ.get(PROJECT_NAME_ENV_VAR, DEFAULT_PROJECT_NAME).strip().lower()
+def get_project_name(project_name_override=None):
+    if project_name_override is not None:
+        project_name = project_name_override.strip().lower()
+    else:
+        project_name = os.environ.get(PROJECT_NAME_ENV_VAR, DEFAULT_PROJECT_NAME).strip().lower()
+
     if project_name:
         return project_name
 
@@ -76,31 +110,106 @@ def get_start_of_week_utc():
     return start_of_week.replace(hour=0, minute=0, second=0, microsecond=0)
 
 
+def format_utc_timestamp(timestamp):
+    return timestamp.isoformat().replace("+00:00", "Z")
+
+
+def parse_datetime_arg(value, argument_name, is_end=False):
+    try:
+        if len(value) == 10:
+            parsed = datetime.strptime(value, "%Y-%m-%d")
+            if is_end:
+                parsed = parsed.replace(hour=23, minute=59, second=59, microsecond=999999)
+            return parsed.replace(tzinfo=timezone.utc)
+
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        print(
+            f"Error: --{argument_name} must be YYYY-MM-DD or an ISO 8601 timestamp.",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+    if parsed.tzinfo is None:
+        return parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def get_report_window(since_override=None, until_override=None):
+    now = datetime.now(timezone.utc)
+    since = parse_datetime_arg(since_override, "since") if since_override else get_start_of_week_utc()
+    until = parse_datetime_arg(until_override, "until", is_end=True) if until_override else now
+
+    if since > until:
+        print("Error: --since must be earlier than or equal to --until.", file=sys.stderr)
+        raise SystemExit(1)
+
+    return format_utc_timestamp(since), format_utc_timestamp(until)
+
+
 def fetch_projects(api_key):
     headers = {"Authorization": f"Bearer {api_key}"}
-    response = requests.get(PROJECTS_URL, headers=headers, timeout=REQUEST_TIMEOUT_SECONDS)
-    response.raise_for_status()
+    projects = {}
+    cursor = None
 
-    return {
-        project.get("name", "").lower(): project.get("id")
-        for project in response.json()
-    }
+    while True:
+        params = {"limit": PAGE_SIZE}
+        if cursor:
+            params["cursor"] = cursor
+
+        response = requests.get(
+            PROJECTS_URL,
+            headers=headers,
+            params=params,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+        for project in payload.get("results", []):
+            projects[project.get("name", "").lower()] = project.get("id")
+
+        cursor = payload.get("next_cursor")
+        if not cursor:
+            return projects
 
 
-def fetch_completed_tasks(api_key, since_str):
+def fetch_completed_tasks(api_key, project_id, since_str, until_str):
     headers = {"Authorization": f"Bearer {api_key}"}
-    params = {
-        "since": since_str,
-        "limit": 100,
-    }
-    response = requests.get(
-        COMPLETED_TASKS_URL,
-        headers=headers,
-        params=params,
-        timeout=REQUEST_TIMEOUT_SECONDS,
-    )
-    response.raise_for_status()
-    return response.json().get("items", [])
+    tasks = []
+    cursor = None
+
+    while True:
+        params = {
+            "since": since_str,
+            "until": until_str,
+            "limit": PAGE_SIZE,
+            "project_id": project_id,
+        }
+        if cursor:
+            params["cursor"] = cursor
+
+        response = requests.get(
+            COMPLETED_TASKS_URL,
+            headers=headers,
+            params=params,
+            timeout=REQUEST_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+
+        payload = response.json()
+        tasks.extend(payload.get("items", []))
+
+        cursor = payload.get("next_cursor")
+        if not cursor:
+            return tasks
+
+
+def format_request_exception(exc):
+    response = getattr(exc, "response", None)
+    if response is not None and response.status_code == 410:
+        return f"{exc} (Todoist reported this endpoint is gone; the API version may need updating.)"
+    return str(exc)
 
 
 def build_table_data(tasks, project_id):
@@ -145,7 +254,7 @@ def build_table_data(tasks, project_id):
     return table_data
 
 
-def print_report(table_data):
+def print_report(table_data, output_format):
     headers = [
         "Date Completed",
         "Task Details",
@@ -153,8 +262,20 @@ def print_report(table_data):
         "Time Task Was Open",
     ]
 
-    if tabulate:
-        print(tabulate(table_data, headers=headers, tablefmt="grid"))
+    if not table_data:
+        print("No completed tasks found for the selected project and time window.")
+        return
+
+    if output_format == "table" and not tabulate:
+        print("Error: table output requires the optional 'tabulate' dependency.", file=sys.stderr)
+        raise SystemExit(1)
+
+    table_renderer = tabulate
+    if output_format == "table" or (output_format == "auto" and table_renderer):
+        if table_renderer is None:
+            print("Error: table output requires the optional 'tabulate' dependency.", file=sys.stderr)
+            raise SystemExit(1)
+        print(table_renderer(table_data, headers=headers, tablefmt="grid"))
         return
 
     header_row = " | ".join(headers)
@@ -166,10 +287,11 @@ def print_report(table_data):
 
 def main():
     load_local_env()
+    args = parse_args()
 
     api_key = get_api_key()
-    project_name = get_project_name()
-    since_str = get_start_of_week_utc().isoformat().replace("+00:00", "Z")
+    project_name = get_project_name(args.project)
+    since_str, until_str = get_report_window(args.since, args.until)
 
     try:
         projects = fetch_projects(api_key)
@@ -181,12 +303,12 @@ def main():
             )
             raise SystemExit(1)
 
-        tasks = fetch_completed_tasks(api_key, since_str)
+        tasks = fetch_completed_tasks(api_key, work_project_id, since_str, until_str)
     except requests.RequestException as exc:
-        print(f"Error talking to Todoist API: {exc}", file=sys.stderr)
+        print(f"Error talking to Todoist API: {format_request_exception(exc)}", file=sys.stderr)
         raise SystemExit(1) from exc
 
-    print_report(build_table_data(tasks, work_project_id))
+    print_report(build_table_data(tasks, work_project_id), args.output)
 
 
 if __name__ == "__main__":
